@@ -1,402 +1,341 @@
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use nix::errno::Errno;
-use nix::libc::{self, pid_t};
-use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{getpid, Pid};
+// Standard configuration
+const CHANGE_WAIT: bool = false; // Change runlevel while waiting for a process to exit?
 
-// Runlevels
+// Debug and test modes
+const DEBUG: bool = false;       // Debug code off
+const INITDEBUG: bool = false;   // Fork at startup to debug init
+
+// Constants
+const INITPID: i32 = 1;          // pid of first process
+const PIPE_FD: i32 = 10;         // File number of initfifo
+const STATE_PIPE: i32 = 11;      // used to pass state through exec
+const WAIT_BETWEEN_SIGNALS: u64 = 3; // default time to wait between TERM and KILL
+
+// Failsafe configuration
+const MAXSPAWN: u32 = 10;        // Max times respawned in..
+const TESTTIME: u64 = 120;       // this much seconds
+const SLEEPTIME: u64 = 300;      // Disable time
+
+// Default path inherited by every child
+const PATH_DEFAULT: &str = "/sbin:/usr/sbin:/bin:/usr/bin";
+
+// Actions to be taken by init
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum RunLevel {
-    Halt = 0,
-    Single = 1,
-    Multi = 2,
-    MultiWithNetwork = 3,
-    Unused = 4,
-    MultiWithNetworkAndX11 = 5,
-    Reboot = 6,
+pub enum InitAction {
+    Respawn = 1,
+    Wait = 2,
+    Once = 3,
+    Boot = 4,
+    BootWait = 5,
+    PowerFail = 6,
+    PowerWait = 7,
+    PowerOkWait = 8,
+    CtrlAltDel = 9,
+    Off = 10,
+    OnDemand = 11,
+    InitDefault = 12,
+    SysInit = 13,
+    PowerFailNow = 14,
+    KbRequest = 15,
 }
 
-impl RunLevel {
-    fn from_char(c: char) -> Option<Self> {
-        match c {
-            '0' => Some(RunLevel::Halt),
-            '1' | 'S' | 's' => Some(RunLevel::Single),
-            '2' => Some(RunLevel::Multi),
-            '3' => Some(RunLevel::MultiWithNetwork),
-            '4' => Some(RunLevel::Unused),
-            '5' => Some(RunLevel::MultiWithNetworkAndX11),
-            '6' => Some(RunLevel::Reboot),
+impl InitAction {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "respawn" => Some(InitAction::Respawn),
+            "wait" => Some(InitAction::Wait),
+            "once" => Some(InitAction::Once),
+            "boot" => Some(InitAction::Boot),
+            "bootwait" => Some(InitAction::BootWait),
+            "powerfail" => Some(InitAction::PowerFail),
+            "powerwait" => Some(InitAction::PowerWait),
+            "powerokwait" => Some(InitAction::PowerOkWait),
+            "ctrlaltdel" => Some(InitAction::CtrlAltDel),
+            "off" => Some(InitAction::Off),
+            "ondemand" => Some(InitAction::OnDemand),
+            "initdefault" => Some(InitAction::InitDefault),
+            "sysinit" => Some(InitAction::SysInit),
+            "powerfailnow" => Some(InitAction::PowerFailNow),
+            "kbrequest" => Some(InitAction::KbRequest),
             _ => None,
         }
     }
 }
 
-// Process entry for tracking spawned processes
-#[derive(Debug)]
-struct ProcessEntry {
-    pid: Pid,
-    cmd: String,
-    runlevels: Vec<RunLevel>,
-    action: String,
-    respawn: bool,
-}
+// String length constants
+const INITTAB_ID: usize = 8;
+const RUNLEVEL_LENGTH: usize = 12;
+const ACTION_LENGTH: usize = 33;
+const PROCESS_LENGTH: usize = 512;
 
-// Main init structure
-struct Init {
-    current_runlevel: RunLevel,
-    processes: HashMap<Pid, ProcessEntry>,
-    shutdown_requested: Arc<AtomicBool>,
-    inittab_path: String,
-}
-
-impl Init {
-    fn new() -> Self {
-        Init {
-            current_runlevel: RunLevel::Multi,
-            processes: HashMap::new(),
-            shutdown_requested: Arc::new(AtomicBool::new(false)),
-            inittab_path: "/etc/inittab".to_string(),
-        }
-    }
-
-    // Parse /etc/inittab file
-    fn parse_inittab(&self) -> Result<Vec<InitTabEntry>, Box<dyn std::error::Error>> {
-        let file = File::open(&self.inittab_path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
-
-        for line in reader.lines() {
-            let line = line?;
-            let line = line.trim();
-
-            // Skip comments and empty lines
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Some(entry) = InitTabEntry::parse(line) {
-                entries.push(entry);
-            }
-        }
-
-        Ok(entries)
-    }
-
-    // Initialize system
-    fn init_system(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("INIT: Starting system initialization");
-
-        // Become session leader
-        unsafe {
-            libc::setsid();
-        }
-
-        // Set up signal handlers
-        self.setup_signal_handlers()?;
-
-        // Parse inittab and start initial processes
-        let entries = self.parse_inittab()?;
-        for entry in entries {
-            if entry.action == "sysinit" {
-                self.run_process(&entry)?;
-            }
-        }
-
-        // Start processes for current runlevel
-        self.change_runlevel(self.current_runlevel)?;
-
-        Ok(())
-    }
-
-    // Setup signal handlers
-    fn setup_signal_handlers(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let shutdown_flag = Arc::clone(&self.shutdown_requested);
-
-        // Handle SIGTERM, SIGINT for shutdown
-        let shutdown_flag_term = Arc::clone(&shutdown_flag);
-        unsafe {
-            signal::signal(Signal::SIGTERM, signal::SigHandler::Handler(handle_shutdown_signal))?;
-            signal::signal(Signal::SIGINT, signal::SigHandler::Handler(handle_shutdown_signal))?;
-        }
-
-        // Handle SIGCHLD for process reaping
-        unsafe {
-            signal::signal(Signal::SIGCHLD, signal::SigHandler::Handler(handle_sigchld))?;
-        }
-
-        Ok(())
-    }
-
-    // Change to a new runlevel
-    fn change_runlevel(&mut self, new_level: RunLevel) -> Result<(), Box<dyn std::error::Error>> {
-        println!("INIT: Changing to runlevel {}", new_level as i32);
-
-        // Kill processes not in new runlevel
-        let mut to_kill = Vec::new();
-        for (pid, process) in &self.processes {
-            if !process.runlevels.contains(&new_level) {
-                to_kill.push(*pid);
-            }
-        }
-
-        for pid in to_kill {
-            self.kill_process(pid)?;
-        }
-
-        // Start new processes for this runlevel
-        let entries = self.parse_inittab()?;
-        for entry in entries {
-            if entry.runlevels.contains(&new_level) &&
-                (entry.action == "respawn" || entry.action == "once") {
-                self.spawn_process(&entry)?;
-            }
-        }
-
-        self.current_runlevel = new_level;
-
-        // Handle special runlevels
-        match new_level {
-            RunLevel::Halt => self.shutdown_system(false)?,
-            RunLevel::Reboot => self.shutdown_system(true)?,
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    // Spawn a process
-    fn spawn_process(&mut self, entry: &InitTabEntry) -> Result<(), Box<dyn std::error::Error>> {
-        let mut cmd_parts = entry.process.split_whitespace();
-        let program = cmd_parts.next().ok_or("Empty command")?;
-        let args: Vec<&str> = cmd_parts.collect();
-
-        let mut command = Command::new(program);
-        command.args(&args);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
-
-        // Set process group
-        unsafe {
-            command.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
-
-        let child = command.spawn()?;
-        let pid = Pid::from_raw(child.id() as pid_t);
-
-        let process_entry = ProcessEntry {
-            pid,
-            cmd: entry.process.clone(),
-            runlevels: entry.runlevels.clone(),
-            action: entry.action.clone(),
-            respawn: entry.action == "respawn",
-        };
-
-        self.processes.insert(pid, process_entry);
-        println!("INIT: Started process {} with PID {}", entry.process, pid);
-
-        Ok(())
-    }
-
-    // Run a process and wait for it to complete
-    fn run_process(&self, entry: &InitTabEntry) -> Result<(), Box<dyn std::error::Error>> {
-        let mut cmd_parts = entry.process.split_whitespace();
-        let program = cmd_parts.next().ok_or("Empty command")?;
-        let args: Vec<&str> = cmd_parts.collect();
-
-        let status = Command::new(program)
-            .args(&args)
-            .status()?;
-
-        if !status.success() {
-            eprintln!("INIT: Process {} failed with status {}", entry.process, status);
-        }
-
-        Ok(())
-    }
-
-    // Kill a process
-    fn kill_process(&mut self, pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(process) = self.processes.get(&pid) {
-            println!("INIT: Terminating process {} (PID {})", process.cmd, pid);
-
-            // Send SIGTERM first
-            if let Err(e) = signal::kill(pid, Signal::SIGTERM) {
-                eprintln!("INIT: Failed to send SIGTERM to {}: {}", pid, e);
-            }
-
-            // Wait a bit, then send SIGKILL if needed
-            thread::sleep(Duration::from_secs(5));
-
-            if let Err(e) = signal::kill(pid, Signal::SIGKILL) {
-                // Process might have already exited
-                if e != Errno::ESRCH {
-                    eprintln!("INIT: Failed to send SIGKILL to {}: {}", pid, e);
-                }
-            }
-
-            self.processes.remove(&pid);
-        }
-
-        Ok(())
-    }
-
-    // Reap child processes
-    fn reap_children(&mut self) {
-        loop {
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(pid, status)) => {
-                    println!("INIT: Process {} exited with status {}", pid, status);
-                    if let Some(process) = self.processes.remove(&pid) {
-                        // Respawn if needed
-                        if process.respawn && process.runlevels.contains(&self.current_runlevel) {
-                            println!("INIT: Respawning {}", process.cmd);
-                            // Create a new InitTabEntry for respawning
-                            let entry = InitTabEntry {
-                                id: format!("respawn_{}", pid),
-                                runlevels: process.runlevels,
-                                action: process.action,
-                                process: process.cmd,
-                            };
-                            if let Err(e) = self.spawn_process(&entry) {
-                                eprintln!("INIT: Failed to respawn process: {}", e);
-                            }
-                        }
-                    }
-                }
-                Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                    println!("INIT: Process {} killed by signal {:?}", pid, signal);
-                    self.processes.remove(&pid);
-                }
-                Ok(_) => {} // Other status types
-                Err(Errno::ECHILD) => break, // No more children
-                Err(e) => {
-                    eprintln!("INIT: waitpid error: {}", e);
-                    break;
-                }
-            }
-        }
-    }
-
-    // Shutdown the system
-    fn shutdown_system(&self, reboot: bool) -> Result<(), Box<dyn std::error::Error>> {
-        println!("INIT: System {} requested", if reboot { "reboot" } else { "shutdown" });
-
-        // Kill all processes
-        unsafe {
-            libc::kill(-1, libc::SIGTERM);
-        }
-
-        thread::sleep(Duration::from_secs(5));
-
-        unsafe {
-            libc::kill(-1, libc::SIGKILL);
-        }
-
-        // Sync filesystems
-        unsafe {
-            libc::sync();
-        }
-
-        // Reboot or halt
-        if reboot {
-            unsafe {
-                libc::reboot(libc::RB_AUTOBOOT);
-            }
-        } else {
-            unsafe {
-                libc::reboot(libc::RB_HALT_SYSTEM);
-            }
-        }
-
-        Ok(())
-    }
-
-    // Main event loop
-    fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.init_system()?;
-
-        while !self.shutdown_requested.load(Ordering::Relaxed) {
-            self.reap_children();
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        self.change_runlevel(RunLevel::Halt)?;
-        Ok(())
+// Values for the 'flags' field (using bitflags)
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct ChildFlags: u32 {
+        const RUNNING = 2;      // Process is still running
+        const KILLME = 4;       // Kill this process
+        const DEMAND = 8;       // "runlevels" a b c
+        const FAILING = 16;     // process respawns rapidly
+        const WAITING = 32;     // We're waiting for this process
+        const ZOMBIE = 64;      // This process is already dead
+        const XECUTED = 128;    // Set if spawned once or more times
     }
 }
 
-// InitTab entry structure
+// Log levels
+#[derive(Debug, Clone, Copy)]
+pub enum LogLevel {
+    Console = 1,        // L_CO - Log on the console
+    Syslog = 2,         // L_SY - Log with syslog()
+    Verbose = 3,        // L_VB - Log with both (L_CO|L_SY)
+}
+
+const NO_PROCESS: i32 = 0;
+
+// Information about a process in the in-core inittab
 #[derive(Debug, Clone)]
-struct InitTabEntry {
-    id: String,
-    runlevels: Vec<RunLevel>,
-    action: String,
-    process: String,
+pub struct Child {
+    pub flags: ChildFlags,              // Status of this entry
+    pub exstat: i32,                    // Exit status of process
+    pub pid: i32,                       // Pid of this process
+    pub tm: u64,                        // When respawned last (Unix timestamp)
+    pub count: u32,                     // Times respawned in the last 2 minutes
+    pub id: String,                     // Inittab id (must be unique, max 8 chars)
+    pub rlevel: String,                 // run levels (max 12 chars)
+    pub action: InitAction,             // what to do
+    pub process: String,                // The command line (max 512 chars)
+    pub new: Option<Box<Child>>,        // New entry (after inittab re-read)
+    pub next: Option<Box<Child>>,       // For the linked list
 }
 
-impl InitTabEntry {
-    fn parse(line: &str) -> Option<Self> {
+impl Child {
+    pub fn new() -> Self {
+        Child {
+            flags: ChildFlags::empty(),
+            exstat: 0,
+            pid: NO_PROCESS,
+            tm: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            count: 0,
+            id: String::new(),
+            rlevel: String::new(),
+            action: InitAction::Once,
+            process: String::new(),
+            new: None,
+            next: None,
+        }
+    }
+
+    pub fn from_inittab_line(line: &str) -> Option<Self> {
         let parts: Vec<&str> = line.split(':').collect();
         if parts.len() != 4 {
             return None;
         }
 
-        let id = parts[0].to_string();
-        let runlevels_str = parts[1];
-        let action = parts[2].to_string();
-        let process = parts[3].to_string();
+        let id = parts[0];
+        let runlevels = parts[1];
+        let action_str = parts[2];
+        let process = parts[3];
 
-        let mut runlevels = Vec::new();
-        for c in runlevels_str.chars() {
-            if let Some(level) = RunLevel::from_char(c) {
-                runlevels.push(level);
-            }
+        // Validate lengths
+        if id.len() > INITTAB_ID ||
+            runlevels.len() > RUNLEVEL_LENGTH ||
+            action_str.len() > ACTION_LENGTH ||
+            process.len() > PROCESS_LENGTH {
+            return None;
         }
 
-        Some(InitTabEntry {
-            id,
-            runlevels,
+        let action = InitAction::from_str(action_str)?;
+
+        Some(Child {
+            flags: ChildFlags::empty(),
+            exstat: 0,
+            pid: NO_PROCESS,
+            tm: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            count: 0,
+            id: id.to_string(),
+            rlevel: runlevels.to_string(),
             action,
-            process,
+            process: process.to_string(),
+            new: None,
+            next: None,
         })
     }
-}
 
-// Signal handlers
-extern "C" fn handle_shutdown_signal(_: libc::c_int) {
-    // Signal shutdown - this would need to communicate with the main thread
-    println!("INIT: Shutdown signal received");
-}
-
-extern "C" fn handle_sigchld(_: libc::c_int) {
-    // Child process died - handled in main loop
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Check if we're PID 1
-    if getpid() != Pid::from_raw(1) {
-        eprintln!("Warning: Not running as PID 1");
+    pub fn should_run_at_level(&self, level: char) -> bool {
+        self.rlevel.contains(level)
     }
 
-    let mut init = Init::new();
-    init.run()
+    pub fn is_running(&self) -> bool {
+        self.flags.contains(ChildFlags::RUNNING)
+    }
+
+    pub fn is_failing(&self) -> bool {
+        self.flags.contains(ChildFlags::FAILING)
+    }
+
+    pub fn mark_running(&mut self) {
+        self.flags.insert(ChildFlags::RUNNING);
+    }
+
+    pub fn mark_zombie(&mut self) {
+        self.flags.remove(ChildFlags::RUNNING);
+        self.flags.insert(ChildFlags::ZOMBIE);
+    }
+
+    pub fn mark_executed(&mut self) {
+        self.flags.insert(ChildFlags::XECUTED);
+    }
 }
 
-// Add to Cargo.toml:
-// [dependencies]
-// nix = "0.27"
+// Tokens in state parser
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StateToken {
+    Ver = 1,
+    End = 2,
+    Rec = 3,
+    Eor = 4,
+    Lev = 5,
+    Flag = 6,
+    Action = 7,
+    Process = 8,
+    Pid = 9,
+    Exs = 10,
+    Eof = -1,
+    Runlevel = -2,
+    ThisLevel = -3,
+    PrevLevel = -4,
+    GotSign = -5,
+    WroteWtmpReboot = -6,
+    WroteUtmpReboot = -7,
+    SlTime = -8,
+    DidBoot = -9,
+    WroteWtmpRlevel = -16,
+    WroteUtmpRlevel = -17,
+}
+
+// Global state struct
+#[derive(Debug)]
+pub struct InitState {
+    pub family: Option<Box<Child>>,     // LinkedList of children
+    pub wrote_wtmp_reboot: bool,
+    pub wrote_utmp_reboot: bool,
+    pub wrote_wtmp_rlevel: bool,
+    pub wrote_utmp_rlevel: bool,
+    pub curlevel: char,                 // Current runlevel
+    pub prevlevel: char,                // Previous runlevel
+}
+
+impl InitState {
+    pub fn new() -> Self {
+        InitState {
+            family: None,
+            wrote_wtmp_reboot: false,
+            wrote_utmp_reboot: false,
+            wrote_wtmp_rlevel: false,
+            wrote_utmp_rlevel: false,
+            curlevel: 'S',   // single-user mode
+            prevlevel: 'N',  // no previous runlevel
+        }
+    }
+
+    // New children are added to the start of the list
+    pub fn add_child(&mut self, mut child: Child) {
+        child.next = self.family.take();
+        self.family = Some(Box::new(child));
+    }
+
+    pub fn find_child_by_id(&self, id: &str) -> Option<&Child> {
+        let mut current = self.family.as_ref();
+        while let Some(child) = current {
+            if child.id == id {
+                return Some(child);
+            }
+            current = child.next.as_ref();
+        }
+        None
+    }
+
+    pub fn find_child_by_pid(&self, pid: i32) -> Option<&Child> {
+        let mut current = self.family.as_ref();
+        while let Some(child) = current {
+            if child.pid == pid {
+                return Some(child);
+            }
+            current = child.next.as_ref();
+        }
+        None
+    }
+
+    pub fn remove_child_by_pid(&mut self, pid: i32) -> Option<Child> {
+        let mut current = &mut self.family;
+        while let Some(child) = current {
+            if child.pid == pid {
+                let mut removed = current.take().unwrap();
+                *current = removed.next.take();
+                return Some(*removed);
+            }
+            current = &mut current.as_mut().unwrap().next;
+        }
+        None
+    }
+}
+
+// FreeBSD specific code
+#[cfg(target_os = "freebsd")]
+mod freebsd_compat {
+    const UTMP_FILE: &str = "/var/run/utmp";
+    const RUN_LVL: i32 = 1;
+
+    #[repr(C)]
+    pub struct Utmp {
+        pub ut_id: [u8; 4],
+    }
+}
+
+// TODO: Implement prototypes
+pub trait InitLogger {
+    fn initlog(&self, level: LogLevel, msg: &str);
+}
+
+pub trait UtmpWriter {
+    fn write_utmp_wtmp(&self, user: &str, id: &str, pid: i32, entry_type: i32, line: &str);
+    fn write_wtmp(&self, user: &str, id: &str, pid: i32, entry_type: i32, line: &str);
+}
+
+pub trait TerminalController {
+    fn set_term(&self, how: i32);
+    fn print(&self, msg: &str);
+}
+
+pub trait WallMessenger {
+    fn wall(&self, text: &str, remote: bool);
+}
+
+macro_rules! initdbg {
+    ($level:expr, $fmt:expr $(, $args:expr)*) => {
+        if DEBUG {
+            // TODO: Call initlog
+            eprintln!($fmt $(, $args)*);
+        }
+    };
+}
+
+pub fn is_valid_runlevel(c: char) -> bool {
+    matches!(c, '0'..='6' | 'S' | 's' | 'A'..='C' | 'a'..='c')
+}
+
+pub fn normalize_runlevel(c: char) -> char {
+    match c {
+        's' => 'S',
+        'a' => 'A',
+        'b' => 'B',
+        'c' => 'C',
+        _ => c,
+    }
+}
+
+fn main() {
+    println!("Copyright 2025 PalindromicBreadLoaf");
+}
