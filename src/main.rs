@@ -14,8 +14,8 @@ const STATE_PIPE: i32 = 11;      // used to pass state through exec
 const WAIT_BETWEEN_SIGNALS: u64 = 3; // default time to wait between TERM and KILL
 
 // Failsafe configuration
-const MAXSPAWN: u32 = 10;        // Max times respawned in..
-const TESTTIME: u64 = 120;       // this much seconds
+const MAXSPAWN: u32 = 10;        // Max times respawned in...
+const TESTTIME: u64 = 120;       // this many seconds
 const SLEEPTIME: u64 = 300;      // Disable time
 
 // Default path inherited by every child
