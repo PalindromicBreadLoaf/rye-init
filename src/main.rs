@@ -1,7 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Standard configuration
 const CHANGE_WAIT: bool = false; // Change runlevel while waiting for a process to exit?
+const INIT_PROGRAM: &str = "/sbin/init";
 
 // Debug and test modes
 const DEBUG: bool = false;       // Debug code off
@@ -18,8 +20,15 @@ const MAXSPAWN: u32 = 10;        // Max times respawned in...
 const TESTTIME: u64 = 120;       // this many seconds
 const SLEEPTIME: u64 = 300;      // Disable time
 
+// Global atomic signals
+static GOT_CONT: AtomicBool = AtomicBool::new(false);
+static GOT_SIGNALS: AtomicBool = AtomicBool::new(false);
+
 // Default path inherited by every child
 const PATH_DEFAULT: &str = "/sbin:/usr/sbin:/bin:/usr/bin";
+
+// Signature for re-exec fd
+const SIGNATURE: &str = "12567362";
 
 // Actions to be taken by init
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,6 +48,7 @@ pub enum InitAction {
     SysInit = 13,
     PowerFailNow = 14,
     KbRequest = 15,
+    NULL = 0,
 }
 
 impl InitAction {
@@ -219,24 +229,44 @@ pub enum StateToken {
 #[derive(Debug)]
 pub struct InitState {
     pub family: Option<Box<Child>>,     // LinkedList of children
+    pub new_family: Option<Box<Child>>, // The list after inittab re-read
     pub wrote_wtmp_reboot: bool,
     pub wrote_utmp_reboot: bool,
     pub wrote_wtmp_rlevel: bool,
     pub wrote_utmp_rlevel: bool,
     pub curlevel: char,                 // Current runlevel
     pub prevlevel: char,                // Previous runlevel
+    pub dfl_level: char,                // Default runlevel
+    pub emerg_shell: bool,              // Start emergency shell?
+    pub sleep_time: u64,                // Sleep time between TERM and KILL
+    pub console_dev: Option<String>,    // Console device
+    pub pipe_fd: i32,                   // /run/initctl
+    pub did_boot: bool,                 // Is BOOT* done?
+    pub reload: bool,                   // Should we do initialization stuff?
+    pub myname: String,                 // What should we exec
+    pub oops_error: i32,                // Used be re-exec. May be refactored out later
 }
 
 impl InitState {
     pub fn new() -> Self {
         InitState {
             family: None,
-            wrote_wtmp_reboot: false,
-            wrote_utmp_reboot: false,
-            wrote_wtmp_rlevel: false,
-            wrote_utmp_rlevel: false,
+            new_family: None,
+            wrote_wtmp_reboot: true,
+            wrote_utmp_reboot: true,
+            wrote_wtmp_rlevel: true,
+            wrote_utmp_rlevel: true,
             curlevel: 'S',   // single-user mode
             prevlevel: 'N',  // no previous runlevel
+            dfl_level: '0',  // Default runlevel
+            emerg_shell: false,
+            sleep_time: WAIT_BETWEEN_SIGNALS,
+            console_dev: None,
+            pipe_fd: -1,
+            did_boot: false,
+            reload: false,
+            myname: INIT_PROGRAM.to_string(),
+            oops_error: 0,
         }
     }
 
@@ -322,6 +352,31 @@ macro_rules! initdbg {
     };
 }
 
+// Signal handler helpers
+pub fn set_got_cont() {
+    GOT_CONT.store(true, Ordering::Relaxed);
+}
+
+pub fn got_cont() -> bool {
+    GOT_CONT.load(Ordering::Relaxed)
+}
+
+pub fn clear_got_cont() {
+    GOT_CONT.store(false, Ordering::Relaxed);
+}
+
+pub fn set_got_signals() {
+    GOT_SIGNALS.store(true, Ordering::Relaxed);
+}
+
+pub fn got_signals() -> bool {
+    GOT_SIGNALS.load(Ordering::Relaxed)
+}
+
+pub fn clear_got_signals() {
+    GOT_SIGNALS.store(false, Ordering::Relaxed);
+}
+
 pub fn is_valid_runlevel(c: char) -> bool {
     matches!(c, '0'..='6' | 'S' | 's' | 'A'..='C' | 'a'..='c')
 }
@@ -334,6 +389,50 @@ pub fn normalize_runlevel(c: char) -> char {
         'c' => 'C',
         _ => c,
     }
+}
+
+pub fn create_emergency_shell() -> Child {
+    Child {
+        flags: ChildFlags::WAITING,
+        exstat: 0,
+        pid: NO_PROCESS,
+        tm: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        count: 0,
+        id: "~~".to_string(),
+        rlevel: "S".to_string(),
+        action: InitAction::Once,
+        process: "/sbin/sulogin".to_string(),
+        new: None,
+        next: None,
+    }
+}
+
+
+// Poweroff child definition
+pub fn create_poweroff_child() -> Child {
+    Child {
+        flags: ChildFlags::empty(),
+        exstat: 0,
+        pid: NO_PROCESS,
+        tm: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        count: 0,
+        id: "~~".to_string(),
+        rlevel: "S".to_string(),
+        action: InitAction::Once,
+        process: "/sbin/shutdown -hP now".to_string(),
+        new: None,
+        next: None,
+    }
+}
+
+pub fn is_power_action(action: InitAction) -> bool {
+    matches!(action,
+        InitAction::PowerWait |
+        InitAction::PowerFail |
+        InitAction::PowerOkWait |
+        InitAction::PowerFailNow |
+        InitAction::CtrlAltDel
+    )
 }
 
 fn main() {
