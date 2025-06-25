@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // Standard configuration
 const CHANGE_WAIT: bool = false; // Change runlevel while waiting for a process to exit?
 const INIT_PROGRAM: &str = "/sbin/init";
+const VERSION: &str = "0.1.0";
 
 // Debug and test modes
 const DEBUG: bool = false;       // Debug code off
@@ -15,10 +16,18 @@ const PIPE_FD: i32 = 10;         // File number of initfifo
 const STATE_PIPE: i32 = 11;      // used to pass state through exec
 const WAIT_BETWEEN_SIGNALS: u64 = 3; // default time to wait between TERM and KILL
 
+// Sleep constants in milliseconds
+const MINI_SLEEP: u64 = 10;
+const SHORT_SLEEP: u64 = 5000;
+const LONG_SLEEP: u64 = 30000;
+
 // Failsafe configuration
 const MAXSPAWN: u32 = 10;        // Max times respawned in...
-const TESTTIME: u64 = 120;       // this many seconds
+const TESTTIME: u64 = 120;       // ...this many seconds
 const SLEEPTIME: u64 = 300;      // Disable time
+
+// State parser command constants and structures
+const NR_EXTRA_ENV: usize = 16;
 
 // Global atomic signals
 static GOT_CONT: AtomicBool = AtomicBool::new(false);
@@ -29,6 +38,21 @@ const PATH_DEFAULT: &str = "/sbin:/usr/sbin:/bin:/usr/bin";
 
 // Signature for re-exec fd
 const SIGNATURE: &str = "12567362";
+
+// Extra environment variables
+pub struct ExtraEnv {
+    pub vars: [Option<String>; NR_EXTRA_ENV],
+}
+
+impl ExtraEnv {
+    pub fn new() -> Self {
+        ExtraEnv {
+            vars: [None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None],
+        }
+    }
+}
+
 
 // Actions to be taken by init
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,7 +72,6 @@ pub enum InitAction {
     SysInit = 13,
     PowerFailNow = 14,
     KbRequest = 15,
-    NULL = 0,
 }
 
 impl InitAction {
@@ -312,6 +335,48 @@ impl InitState {
     }
 }
 
+// Command lookup table for state parser
+struct StateCommand {
+    name: &'static str,
+    cmd: StateToken,
+}
+
+const STATE_COMMANDS: &[StateCommand] = &[
+    StateCommand { name: "VER", cmd: StateToken::Ver },
+    StateCommand { name: "END", cmd: StateToken::End },
+    StateCommand { name: "REC", cmd: StateToken::Rec },
+    StateCommand { name: "EOR", cmd: StateToken::Eor },
+    StateCommand { name: "LEV", cmd: StateToken::Lev },
+    StateCommand { name: "FL ", cmd: StateToken::Flag },
+    StateCommand { name: "AC ", cmd: StateToken::Action },
+    StateCommand { name: "CMD", cmd: StateToken::Process },
+    StateCommand { name: "PID", cmd: StateToken::Pid },
+    StateCommand { name: "EXS", cmd: StateToken::Exs },
+    StateCommand { name: "-RL", cmd: StateToken::Runlevel },
+    StateCommand { name: "-TL", cmd: StateToken::ThisLevel },
+    StateCommand { name: "-PL", cmd: StateToken::PrevLevel },
+    StateCommand { name: "-SI", cmd: StateToken::GotSign },
+    StateCommand { name: "-WR", cmd: StateToken::WroteWtmpReboot },
+    StateCommand { name: "-WU", cmd: StateToken::WroteUtmpReboot },
+    StateCommand { name: "-ST", cmd: StateToken::SlTime },
+    StateCommand { name: "-DB", cmd: StateToken::DidBoot },
+    StateCommand { name: "-LW", cmd: StateToken::WroteWtmpRlevel },
+    StateCommand { name: "-LU", cmd: StateToken::WroteUtmpRlevel },
+];
+
+// Flag lookup table
+struct FlagMapping {
+    name: &'static str,
+    mask: ChildFlags,
+}
+
+const FLAG_MAPPINGS: &[FlagMapping] = &[
+    FlagMapping { name: "RU", mask: ChildFlags::RUNNING },
+    FlagMapping { name: "DE", mask: ChildFlags::DEMAND },
+    FlagMapping { name: "XD", mask: ChildFlags::XECUTED },
+    FlagMapping { name: "WT", mask: ChildFlags::WAITING },
+];
+
 // FreeBSD specific code
 #[cfg(target_os = "freebsd")]
 mod freebsd_compat {
@@ -433,6 +498,156 @@ pub fn is_power_action(action: InitAction) -> bool {
         InitAction::PowerFailNow |
         InitAction::CtrlAltDel
     )
+}
+
+// Sleep function - sleeps for specified milliseconds
+pub fn do_msleep(msec: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(msec));
+}
+
+// Non-failing memory allocation
+pub fn imalloc(size: usize) -> Vec<u8> {
+    loop {
+        match std::panic::catch_unwind(|| vec![0u8; size]) {
+            Ok(vec) => return vec,
+            Err(_) => {
+                eprintln!("out of memory");
+                do_msleep(SHORT_SLEEP);
+            }
+        }
+    }
+}
+
+// String duplication
+pub fn istrdup(s: &str) -> String {
+    loop {
+        match std::panic::catch_unwind(|| s.to_string()) {
+            Ok(string) => return string,
+            Err(_) => {
+                eprintln!("out of memory");
+                do_msleep(SHORT_SLEEP);
+            }
+        }
+    }
+}
+
+// Send state information to a file descriptor
+pub fn send_state<W: std::io::Write>(mut writer: W, state: &InitState) -> std::io::Result<()> {
+    use std::io::Write;
+
+    writeln!(writer, "VER{}", VERSION)?;
+    writeln!(writer, "-RL{}", state.curlevel)?;
+    writeln!(writer, "-TL{}", state.curlevel)?; // thislevel same as curlevel in our implementation
+    writeln!(writer, "-PL{}", state.prevlevel)?;
+    writeln!(writer, "-SI{}", if got_signals() { 1 } else { 0 })?;
+    writeln!(writer, "-WR{}", if state.wrote_wtmp_reboot { 1 } else { 0 })?;
+    writeln!(writer, "-WU{}", if state.wrote_utmp_reboot { 1 } else { 0 })?;
+    writeln!(writer, "-ST{}", state.sleep_time)?;
+    writeln!(writer, "-DB{}", if state.did_boot { 1 } else { 0 })?;
+
+    // Iterate through family list
+    let mut current = state.family.as_ref();
+    while let Some(child) = current {
+        writeln!(writer, "REC{}", child.id)?;
+        writeln!(writer, "LEV{}", child.rlevel)?;
+
+        // Write flags
+        for flag_mapping in FLAG_MAPPINGS {
+            if child.flags.contains(flag_mapping.mask) {
+                writeln!(writer, "FL {}", flag_mapping.name)?;
+            }
+        }
+
+        writeln!(writer, "PID{}", child.pid)?;
+        writeln!(writer, "EXS{}", child.exstat)?;
+
+        // Write action
+        let action_name = match child.action {
+            InitAction::Respawn => "respawn",
+            InitAction::Wait => "wait",
+            InitAction::Once => "once",
+            InitAction::Boot => "boot",
+            InitAction::BootWait => "bootwait",
+            InitAction::PowerFail => "powerfail",
+            InitAction::PowerWait => "powerwait",
+            InitAction::PowerOkWait => "powerokwait",
+            InitAction::CtrlAltDel => "ctrlaltdel",
+            InitAction::Off => "off",
+            InitAction::OnDemand => "ondemand",
+            InitAction::InitDefault => "initdefault",
+            InitAction::SysInit => "sysinit",
+            InitAction::PowerFailNow => "powerfailnow",
+            InitAction::KbRequest => "kbrequest",
+        };
+
+        writeln!(writer, "AC {}", action_name)?;
+        writeln!(writer, "CMD{}", child.process)?;
+        writeln!(writer, "EOR")?;
+
+        current = child.next.as_ref();
+    }
+
+    writeln!(writer, "END")?;
+    Ok(())
+}
+
+// Re-implementation of get_string in C
+pub fn get_string<R: std::io::Read>(reader: &mut R, max_size: usize) -> std::io::Result<String> {
+    let mut result = String::new();
+    let mut buf = [0u8; 1];
+
+    while result.len() < max_size {
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {
+                let c = buf[0];
+                if c == b'\n' {
+                    break;
+                }
+                result.push(c as char);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(result)
+}
+
+// Read and discard data until newline
+pub fn get_void<R: std::io::Read>(reader: &mut R) -> std::io::Result<bool> {
+    let mut buf = [0u8; 1];
+
+    loop {
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {
+                if buf[0] == b'\n' {
+                    return Ok(true);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+// Read the next command from state pipe
+pub fn get_cmd<R: std::io::Read>(reader: &mut R) -> std::io::Result<StateToken> {
+    let mut cmd_buf = [0u8; 3];
+
+    match reader.read_exact(&mut cmd_buf) {
+        Ok(()) => {
+            let cmd_str = std::str::from_utf8(&cmd_buf).unwrap_or("   ");
+
+            for state_cmd in STATE_COMMANDS {
+                if state_cmd.name == cmd_str {
+                    return Ok(state_cmd.cmd);
+                }
+            }
+
+            Ok(StateToken::Eof)
+        }
+        Err(_) => Ok(StateToken::Eof),
+    }
 }
 
 fn main() {
