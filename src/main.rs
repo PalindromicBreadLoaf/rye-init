@@ -592,46 +592,42 @@ pub fn send_state<W: std::io::Write>(mut writer: W, state: &InitState) -> std::i
 }
 
 // Re-implementation of get_string in C
-pub fn get_string<R: std::io::Read>(reader: &mut R, max_size: usize) -> std::io::Result<String> {
+pub fn get_string<R: std::io::BufRead>(reader: &mut R, max_size: usize) -> std::io::Result<String> {
     let mut result = String::new();
-    let mut buf = [0u8; 1];
+    let bytes_read = reader.read_line(&mut result)?;
 
-    while result.len() < max_size {
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {
-                let c = buf[0];
-                if c == b'\n' {
-                    break;
-                }
-                result.push(c as char);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+    if bytes_read == 0 {
+        return Ok(String::new());
+    }
+
+    // Remove newline
+    if result.ends_with('\n') {
+        result.pop();
+        if result.ends_with('\r') {
+            result.pop();
         }
+    }
+
+    // Truncate if too long
+    if result.len() > max_size {
+        result.truncate(max_size);
     }
 
     Ok(result)
 }
 
 // Read and discard data until newline
-pub fn get_void<R: std::io::Read>(reader: &mut R) -> std::io::Result<bool> {
-    let mut buf = [0u8; 1];
-
-    loop {
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {
-                if buf[0] == b'\n' {
-                    return Ok(true);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(e) => return Err(e),
-        }
+pub fn get_void<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<bool> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(true),
+        Err(e) => Err(e),
     }
 }
 
 // Read the next command from state pipe
-pub fn get_cmd<R: std::io::Read>(reader: &mut R) -> std::io::Result<StateToken> {
+pub fn get_cmd<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<StateToken> {
     let mut cmd_buf = [0u8; 3];
 
     match reader.read_exact(&mut cmd_buf) {
@@ -648,6 +644,137 @@ pub fn get_cmd<R: std::io::Read>(reader: &mut R) -> std::io::Result<StateToken> 
         }
         Err(_) => Ok(StateToken::Eof),
     }
+}
+
+// Read a Child record from the state pipe
+pub fn get_record<R: std::io::BufRead>(reader: &mut R, state: &mut InitState) -> std::io::Result<Option<Child>> {
+    loop {
+        match get_cmd(reader)? {
+            StateToken::End => {
+                get_void(reader)?;
+                return Ok(None);
+            }
+            StateToken::Rec => break,
+            StateToken::Runlevel => {
+                let line = get_string(reader, 32)?;
+                if let Some(c) = line.chars().next() {
+                    state.curlevel = c;
+                }
+            }
+            StateToken::ThisLevel => {
+                let line = get_string(reader, 32)?;
+                if let Some(c) = line.chars().next() {
+                    state.curlevel = c;
+                }
+            }
+            StateToken::PrevLevel => {
+                let line = get_string(reader, 32)?;
+                if let Some(c) = line.chars().next() {
+                    state.prevlevel = c;
+                }
+            }
+            StateToken::GotSign => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<u32>() {
+                    if val != 0 {
+                        set_got_signals();
+                    }
+                }
+            }
+            StateToken::WroteWtmpReboot => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<i32>() {
+                    state.wrote_wtmp_reboot = val != 0;
+                }
+            }
+            StateToken::WroteUtmpReboot => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<i32>() {
+                    state.wrote_utmp_reboot = val != 0;
+                }
+            }
+            StateToken::SlTime => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<u64>() {
+                    state.sleep_time = val;
+                }
+            }
+            StateToken::DidBoot => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<i32>() {
+                    state.did_boot = val != 0;
+                }
+            }
+            StateToken::WroteWtmpRlevel => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<i32>() {
+                    state.wrote_wtmp_rlevel = val != 0;
+                }
+            }
+            StateToken::WroteUtmpRlevel => {
+                let line = get_string(reader, 32)?;
+                if let Ok(val) = line.trim().parse::<i32>() {
+                    state.wrote_utmp_rlevel = val != 0;
+                }
+            }
+            StateToken::Eof => {
+                state.oops_error = -1;
+                return Ok(None);
+            }
+            _ => {
+                get_void(reader)?;
+            }
+        }
+    }
+
+    let mut child = Child::new();
+    child.id = get_string(reader, INITTAB_ID)?;
+
+    loop {
+        match get_cmd(reader)? {
+            StateToken::Eor => {
+                get_void(reader)?;
+                break;
+            }
+            StateToken::Pid => {
+                let line = get_string(reader, 32)?;
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    child.pid = pid;
+                }
+            }
+            StateToken::Exs => {
+                let line = get_string(reader, 32)?;
+                if let Ok(exstat) = line.trim().parse::<i32>() {
+                    child.exstat = exstat;
+                }
+            }
+            StateToken::Lev => {
+                child.rlevel = get_string(reader, RUNLEVEL_LENGTH)?;
+            }
+            StateToken::Process => {
+                child.process = get_string(reader, PROCESS_LENGTH)?;
+            }
+            StateToken::Flag => {
+                let flag_str = get_string(reader, 32)?;
+                for flag_mapping in FLAG_MAPPINGS {
+                    if flag_mapping.name == flag_str.trim() {
+                        child.flags.insert(flag_mapping.mask);
+                        break;
+                    }
+                }
+            }
+            StateToken::Action => {
+                let action_str = get_string(reader, 32)?;
+                child.action = InitAction::from_str(action_str.trim()).unwrap_or(InitAction::Off);
+            }
+            _ => {
+                state.oops_error = -1;
+                return Ok(None);
+            }
+        }
+    }
+
+    Ok(Some(child))
 }
 
 fn main() {
