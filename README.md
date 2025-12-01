@@ -9,4 +9,9 @@ If the original authors of sysvinit wish for me to take this down for any reason
 This project currently does not function in the slightest. Don't even try. Pull-requests are open if someone wants to
 add a feature though.
 
+## Notes
+This is mostly a project for me to learn how to write Rust proper coming from someone who is almost exclusively a C
+dev. Don't expect anything crazy to come from this, and even if it does reach a working state, it'll still almost 100%
+be a better idea to just use the original, battle-tested sysvinit.
+
 
