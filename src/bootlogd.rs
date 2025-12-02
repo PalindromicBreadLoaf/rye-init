@@ -24,7 +24,13 @@
  *		Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  *
  */
+use libc;
+use std::io::Write;
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::GOT_SIGNALS;
 
 const MAX_CONSOLES: i8 = 16;
@@ -104,4 +110,97 @@ impl RingBuf {
             RINGBUF_SIZE - self.in_idx + self.out_idx
         }
     }
+}
+
+fn write_log(
+    fp: &mut File,
+    data: &[u8],
+    syncalot: bool,
+    print_escape_characters: bool,
+    first_run: &mut bool,
+) -> io::Result<()> {
+    let mut inside_esc: u8 = 0;
+    let mut should_sync = false;
+
+    let mut i = 0;
+    while i < data.len() {
+        if (*first_run) {
+            let now = SystemTime::now();
+            if let Ok(n) = now.duration_since(UNIX_EPOCH) {
+                let ts = format!("{:?}", now);
+                write!(fp, "{}: ", ts)?;
+            } else {
+                write!(fp, "?: ")?;
+            }
+            should_sync = true;
+            *first_run = false;
+        }
+
+        let byte = data[i];
+        let mut ignore = false;
+
+        if !print_escape_characters {
+            if inside_esc == 1 {
+                if byte == b'[' {
+                    ignore = true;
+                    inside_esc = 2;
+                } else {
+                    if byte >= 64 && byte <= 95 {
+                        ignore = true;
+                    }
+                    inside_esc = 0;
+                }
+            } else if inside_esc == 2 {
+                match byte {
+                    b'0'..=b'9' | b';' | 32..=47 => {
+                        if inside_esc != 0 {
+                            ignore = true;
+                        }
+                    }
+                    64..=126 => {
+                        if inside_esc != 0 {
+                            ignore = true;
+                            inside_esc = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                match byte {
+                    b'\r' => {
+                        ignore = true;
+                    }
+                    27 => {
+                        // ESC
+                        ignore = true;
+                        inside_esc = 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !ignore {
+            fp.write_all(&[byte])?;
+        }
+
+        // if the byte written was newline, next char should get timestamp prefix.
+        // Approximate this by checking last byte, hopefully this is okay?
+        if byte == b'\n' {
+            *first_run = true;
+        }
+
+        i += 1;
+    }
+
+    if should_sync {
+        fp.flush()?;
+        if syncalot {
+            unsafe {
+                libc::fsync(fp.as_raw_fd());
+            }
+        }
+    }
+
+    Ok(())
 }
