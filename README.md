@@ -1,5 +1,7 @@
 # rye-init
 
+ATTENTION: DEVELOPMENT OF THIS HAS MOVED TO [Codeberg](https://codeberg.org/PalindromicBreadLoaf/rye-init): https://codeberg.org/PalindromicBreadLoaf/rye-init.
+
 rye-init is a rewrite of sysvinit in Rust hoping to be a drop-in replacement for [sysvinit](https://codeberg.org/thejessesmith/sysvinit).
 The only reason this project exists is because of this video: [Arch Linux Is Adopting A Rust Based Init...](https://www.youtube.com/watch?v=UTHIZTMoyIc)
 
